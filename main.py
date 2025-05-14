@@ -2,6 +2,7 @@ import os
 
 from dotenv import load_dotenv
 from pyrogram.client import Client as PyroClient
+from pyrogram.errors.exceptions import SessionPasswordNeeded
 from telegram import KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -11,6 +12,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telethon.errors import SessionPasswordNeededError
 from telethon.sessions import StringSession
 from telethon.sync import TelegramClient
 
@@ -20,7 +22,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN") or ""
 API_ID = os.getenv("API_ID") or 2
 API_HASH = os.getenv("API_HASH") or ""
 
-SELECTING_LIB, PHONE_NUMBER, CODE = range(3)
+SELECTING_LIB, PHONE_NUMBER, PASSWORD, CODE = range(4)
 
 CANCEL_BUTTON = KeyboardButton("❌ Cancel")
 EXCLUDE_REGEX = filters.Regex(r"^❌ Cancel|🔁 Again$")
@@ -91,8 +93,9 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if lib == "⚡ Telethon":
             client = TelegramClient(StringSession(), int(API_ID), API_HASH)
             await client.connect()
-            await client.send_code_request(context.user_data["phone"])
+            code_hash = await client.send_code_request(context.user_data["phone"])
             context.user_data["client"] = client
+            context.user_data["code_hash"] = code_hash
         else:
             client = PyroClient(
                 name=":memory:",
@@ -110,8 +113,9 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return CODE
     except Exception as e:
+        print(e)
         await update.message.reply_text(
-            f"❌ Unexpected Error. Try again",
+            f"❌ Error: {str(e)}\n\nPlease try again.",
             reply_markup=ReplyKeyboardRemove(),
         )
         return ConversationHandler.END
@@ -124,6 +128,7 @@ async def get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lib = context.user_data["lib"]
     phone = context.user_data["phone"]
     client = context.user_data["client"]
+    code_hash = context.user_data["code_hash"]
     reply_markup = ReplyKeyboardMarkup(
         [[KeyboardButton("🔁 Again")]], resize_keyboard=True
     )
@@ -131,30 +136,81 @@ async def get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if lib == "⚡ Telethon":
             await client.sign_in(phone=phone, code=code)
-            session_str = client.session.save()
+            session_str = await client.session.save()
             await client.disconnect()
             await update.message.reply_text(
-                f"✅ *Telethon session string:*\n```\n{session_str}\n```",
+                f"✅ *Telethon session string:*\n\n`{session_str}`",
                 parse_mode="Markdown",
                 reply_markup=reply_markup,
             )
         else:
             await client.sign_in(
                 phone_number=phone,
-                phone_code_hash=context.user_data["code_hash"].phone_code_hash,
+                phone_code_hash=code_hash.phone_code_hash,
                 phone_code=code,
             )
-            session_str = client.export_session_string()
-            await client.stop()
+            session_str = await client.export_session_string()
             await update.message.reply_text(
-                f"✅ *Pyrogram session string:*\n```\n{session_str}\n```",
+                f"✅ *Pyrogram session string:*\n\n`{session_str}`",
                 parse_mode="Markdown",
                 reply_markup=reply_markup,
             )
 
     except Exception as e:
+        print(e)
+        if isinstance(e, (SessionPasswordNeededError, SessionPasswordNeeded)):
+            context.user_data["code"] = code
+            context.user_data["client"] = client
+            await update.message.reply_text(
+                "This account has 2FA enabled. Please enter your password:",
+                reply_markup=ReplyKeyboardMarkup(
+                    [[CANCEL_BUTTON]], resize_keyboard=True
+                ),
+            )
+            return PASSWORD
+
         await update.message.reply_text(
-            f"❌ Error: {str(e)}", reply_markup=ReplyKeyboardRemove()
+            f"❌ Error: {str(e)}\n\nPlease try again.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+    return ConversationHandler.END
+
+
+async def get_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not context.user_data:
+        return
+    password = str(update.message.text).strip()
+    lib = context.user_data["lib"]
+    client = context.user_data["client"]
+    reply_markup = ReplyKeyboardMarkup(
+        [[KeyboardButton("🔁 Again")]], resize_keyboard=True
+    )
+
+    try:
+        if lib == "⚡ Telethon":
+            await client.sign_in(password=password)
+            session_str = await client.session.save()
+            await client.disconnect()
+            await update.message.reply_text(
+                f"✅ *Telethon session string:*\n\n`{session_str}`",
+                parse_mode="Markdown",
+                reply_markup=reply_markup,
+            )
+        else:
+            await client.check_password(password)
+            session_str = await client.export_session_string()
+            await update.message.reply_text(
+                f"✅ *Pyrogram session string:*\n\n`{session_str}`",
+                parse_mode="Markdown",
+                reply_markup=reply_markup,
+            )
+
+    except Exception as e:
+        print(e)
+        await update.message.reply_text(
+            f"❌ Error: {str(e)}\n\nPlease try again.",
+            reply_markup=ReplyKeyboardRemove(),
         )
 
     return ConversationHandler.END
@@ -217,6 +273,11 @@ def main():
             CODE: [
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND & ~EXCLUDE_REGEX, get_code
+                )
+            ],
+            PASSWORD: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & ~EXCLUDE_REGEX, get_password
                 )
             ],
         },
